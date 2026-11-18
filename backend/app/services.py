@@ -1,11 +1,10 @@
-import io
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sqlalchemy.orm import Session
-from .models import PassengerCount, Route, Vehicle, Forecast, ModelRun
+from .models import Forecast, ModelRun, OptimizationPlan, PassengerCount, Route, Vehicle
 
 
 def get_passenger_frame(db: Session) -> pd.DataFrame:
@@ -28,13 +27,17 @@ def validate_dataframe(df: pd.DataFrame) -> dict:
     missing_columns = sorted(required - set(df.columns))
     duplicate_count = int(df.duplicated().sum())
     missing_values = {k: int(v) for k, v in df.isna().sum().items() if v}
-    numeric = pd.to_numeric(df.get("passenger_count"), errors="coerce")
+    numeric = pd.to_numeric(df["passenger_count"], errors="coerce") if "passenger_count" in df else pd.Series(dtype=float)
+    timestamps = pd.to_datetime(df["timestamp"], errors="coerce") if "timestamp" in df else pd.Series(dtype="datetime64[ns]")
     return {
         "valid": not missing_columns,
         "missing_columns": missing_columns,
         "missing_values": missing_values,
         "duplicate_rows": duplicate_count,
         "row_count": len(df),
+        "invalid_timestamps": int(timestamps.isna().sum()),
+        "invalid_passenger_counts": int(numeric.isna().sum()),
+        "non_integer_passenger_counts": int((numeric.notna() & ((numeric % 1) != 0)).sum()),
         "negative_passenger_counts": int((numeric < 0).sum()),
     }
 
@@ -56,16 +59,22 @@ def train_and_forecast(db: Session) -> dict:
     hourly["rolling_24"] = hourly.groupby("route_id")["passenger_count"].transform(
         lambda s: s.shift(1).rolling(24, min_periods=1).mean()
     )
-    model_data = hourly.dropna()
+    hourly["lag_24"] = hourly["lag_24"].fillna(hourly["lag_1"])
+    hourly["rolling_24"] = hourly["rolling_24"].fillna(hourly["lag_1"])
+    model_data = hourly.dropna(subset=["timestamp", "passenger_count", "lag_1"])
     if len(model_data) < 24:
         return {"error": "Not enough cleaned hourly records for model training."}
 
     features = ["hour", "weekday", "lag_1", "lag_24", "rolling_24"]
-    split = max(1, int(len(model_data) * 0.8))
-    train, test = model_data.iloc[:split], model_data.iloc[split:]
-    if test.empty:
-        test = model_data.iloc[-1:]
-        train = model_data.iloc[:-1]
+    unique_times = model_data["timestamp"].drop_duplicates().sort_values().tolist()
+    if len(unique_times) < 2:
+        return {"error": "At least two distinct hourly timestamps are required for chronological evaluation."}
+    split_index = min(len(unique_times) - 1, max(1, int(len(unique_times) * 0.8)))
+    split_time = unique_times[split_index]
+    train = model_data[model_data["timestamp"] < split_time]
+    test = model_data[model_data["timestamp"] >= split_time]
+    if train.empty or test.empty:
+        return {"error": "Not enough distinct timestamps for a chronological train/test split."}
 
     # Seasonal naive predicts from the same hour one day earlier.
     seasonal_actual = test["lag_24"].fillna(test["lag_1"]).fillna(test["passenger_count"].mean())
@@ -78,29 +87,31 @@ def train_and_forecast(db: Session) -> dict:
         mae = mean_absolute_error(y_true, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
         wape = float(np.sum(np.abs(y_true - y_pred)) / max(np.sum(np.abs(y_true)), 1) * 100)
-        peak_mae = float(mean_absolute_error(y_true[y_true >= np.percentile(y_true, 90)],
-                                            y_pred[y_true >= np.percentile(y_true, 90)]))
+        peak_mask = y_true >= np.percentile(y_true, 90)
+        peak_mae = float(mean_absolute_error(y_true[peak_mask], y_pred[peak_mask]))
         return {"mae": round(mae, 2), "rmse": round(rmse, 2), "wape": round(wape, 2), "peak_mae": round(peak_mae, 2)}
 
     seasonal_metrics = metrics(actual, seasonal_actual)
     rf_metrics = metrics(actual, predicted)
     db.query(ModelRun).delete()
+    all_synthetic = bool(frame["synthetic"].all())
     db.add_all([
-        ModelRun(name="Seasonal Naive", model_type="Seasonal naive", synthetic=bool(frame["synthetic"].any()), **seasonal_metrics),
-        ModelRun(name="Random Forest", model_type="Random Forest Regressor", synthetic=bool(frame["synthetic"].any()), **rf_metrics),
+        ModelRun(name="Seasonal Naive", model_type="Seasonal naive", synthetic=all_synthetic, **seasonal_metrics),
+        ModelRun(name="Random Forest", model_type="Random Forest Regressor", synthetic=all_synthetic, **rf_metrics),
     ])
 
     # Generate route-specific 24-hour forecasts using the latest temporal features.
     forecasts = []
     db.query(Forecast).delete()
     last = hourly.groupby("route_id").tail(1)
+    base_timestamp = hourly["timestamp"].max()
     for _, route_row in last.iterrows():
-        base_timestamp = hourly["timestamp"].max()
+        history = hourly[hourly["route_id"] == route_row["route_id"]]["passenger_count"].astype(float).tolist()
         for hour_offset in range(24):
             timestamp = base_timestamp + timedelta(hours=hour_offset + 1)
-            lag_1 = float(route_row["passenger_count"])
-            lag_24 = float(hourly[(hourly["route_id"] == route_row["route_id"])].tail(24)["passenger_count"].mean())
-            rolling_24 = float(hourly[(hourly["route_id"] == route_row["route_id"])].tail(24)["passenger_count"].mean())
+            lag_1 = history[-1]
+            lag_24 = history[-24] if len(history) >= 24 else float(np.mean(history))
+            rolling_24 = float(np.mean(history[-24:]))
             feature = pd.DataFrame([{
                 "hour": timestamp.hour,
                 "weekday": timestamp.weekday(),
@@ -111,21 +122,23 @@ def train_and_forecast(db: Session) -> dict:
             demand = max(0.0, float(rf.predict(feature)[0]))
             item = {"timestamp": timestamp.isoformat(), "route_id": route_row["route_id"], "predicted_demand": round(demand, 2)}
             forecasts.append(item)
+            history.append(demand)
             db.add(Forecast(timestamp=timestamp, route_id=route_row["route_id"],
                             predicted_demand=demand, model_name="Random Forest"))
     db.commit()
 
     comparison = [
-        {"timestamp": r.timestamp.isoformat(), "route_id": r.route_id,
-         "actual": 0.0, "predicted": round(r.predicted_demand, 2)}
-        for r in test.assign(timestamp=test["timestamp"]).itertuples()
-    ] if False else [
-        {"timestamp": str(t), "actual": round(float(y), 2), "predicted": round(float(p), 2)}
-        for t, y, p in zip(test["timestamp"].tail(len(predicted)), actual, predicted)
+        {"timestamp": str(t), "route_id": str(route_id),
+         "actual": round(float(y), 2), "predicted": round(float(p), 2)}
+        for t, route_id, y, p in zip(test["timestamp"], test["route_id"], actual, predicted)
     ]
     high_demand = sorted(forecasts, key=lambda x: x["predicted_demand"], reverse=True)[:10]
     return {
-        "synthetic": bool(frame["synthetic"].all()),
+        "synthetic": all_synthetic,
+        "peak_hours": [
+            {"hour": int(hour), "average_demand": round(float(value), 2)}
+            for hour, value in hourly.groupby("hour")["passenger_count"].mean().sort_values(ascending=False).head(5).items()
+        ],
         "metrics": {"seasonal_naive": seasonal_metrics, "random_forest": rf_metrics},
         "comparison": comparison[-100:],
         "forecast": forecasts,
@@ -136,8 +149,8 @@ def train_and_forecast(db: Session) -> dict:
 def optimize_routes(db: Session) -> dict:
     try:
         import pulp
-    except Exception:
-        pulp = None
+    except ImportError as exc:
+        raise RuntimeError("PuLP is required for route optimization. Install backend requirements.") from exc
     forecasts = db.query(Forecast).all()
     if not forecasts:
         trained = train_and_forecast(db)
@@ -149,58 +162,90 @@ def optimize_routes(db: Session) -> dict:
     for item in forecasts:
         route_forecasts.setdefault(item.route_id, []).append(item.predicted_demand)
     route_lookup = {r.route_code: r for r in db.query(Route).all()}
-    vehicle_lookup = {}
-    for vehicle in db.query(Vehicle).filter(Vehicle.available == True).all():
+    available_vehicles = db.query(Vehicle).filter(Vehicle.available.is_(True)).all()
+    current_by_route = {}
+    for vehicle in db.query(Vehicle).all():
         if vehicle.route_id:
-            route = db.query(Route).filter(Route.id == vehicle.route_id).first()
-            if route:
-                vehicle_lookup.setdefault(route.route_code, []).append(vehicle)
+            current_by_route[vehicle.route_id] = current_by_route.get(vehicle.route_id, 0) + 1
+
+    route_inputs = []
+    for code, values in route_forecasts.items():
+        route = route_lookup.get(code)
+        if route:
+            route_inputs.append((code, route, float(max(values))))
+    if not route_inputs:
+        return {"feasible": False, "error": "No forecasted demand matches a registered route.", "plans": []}
+
+    model = pulp.LpProblem("transit_fleet_allocation", pulp.LpMinimize)
+    trip_vars = {}
+    assignment_vars = {}
+    unmet_vars = {}
+    trips_per_vehicle = {}
+    unmet_penalty = 10000.0
+    max_capacity = max((vehicle.capacity for vehicle in available_vehicles), default=0)
+    for code, route, demand in route_inputs:
+        trip_vars[code] = pulp.LpVariable(
+            f"trips_{route.id}", lowBound=route.min_frequency,
+            upBound=route.max_frequency, cat="Integer",
+        )
+        unmet_vars[code] = pulp.LpVariable(f"unmet_{route.id}", lowBound=0)
+        trips_per_vehicle[code] = max(1, int(60 / max(route.estimated_travel_min, 1)))
+        assignment_vars[code] = {
+            vehicle.id: pulp.LpVariable(f"route_{route.id}_vehicle_{vehicle.id}", cat="Binary")
+            for vehicle in available_vehicles
+        }
+        vehicle_capacity = pulp.lpSum(
+            assignment_vars[code][vehicle.id] * vehicle.capacity * trips_per_vehicle[code]
+            for vehicle in available_vehicles
+        )
+        model += trip_vars[code] * max_capacity + unmet_vars[code] >= demand
+        model += vehicle_capacity + unmet_vars[code] >= demand
+        model += pulp.lpSum(assignment_vars[code].values()) <= trip_vars[code]
+
+    for vehicle in available_vehicles:
+        model += pulp.lpSum(
+            assignment_vars[code][vehicle.id]
+            for code, _, _ in route_inputs
+        ) <= 1
+    model += pulp.lpSum(
+        unmet_vars[code] * unmet_penalty
+        + trip_vars[code] * route.operating_cost
+        + pulp.lpSum(assignment_vars[code].values()) * 0.01
+        for code, route, _ in route_inputs
+    )
+    status = model.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] != "Optimal":
+        return {
+            "feasible": False,
+            "error": f"Optimization solver did not find an optimal plan: {pulp.LpStatus[status]}",
+            "plans": [],
+        }
 
     plans = []
     total_unmet = 0.0
     fleet_used = 0
     db.query(OptimizationPlan).delete()
-    for code, forecast_values in route_forecasts.items():
-        route = route_lookup.get(code)
-        if not route:
-            continue
-        demand = float(sum(forecast_values) / len(forecast_values))
-        vehicles = vehicle_lookup.get(code, [])
-        if pulp:
-            # PuLP integer program: minimize vehicle/trip cost and unmet demand
-            # while enforcing route frequency and available-fleet constraints.
-            model = pulp.LpProblem(f"allocation_{code}", pulp.LpMinimize)
-            trip_count = pulp.LpVariable("trips", lowBound=route.min_frequency,
-                                         upBound=route.max_frequency, cat="Integer")
-            vehicle_count = pulp.LpVariable("vehicles", lowBound=0,
-                                            upBound=max(len(vehicles), 0), cat="Integer")
-            unmet_variable = pulp.LpVariable("unmet_demand", lowBound=0)
-            average_capacity = sum(v.capacity for v in vehicles) / max(len(vehicles), 1)
-            capacity_total = trip_count * average_capacity
-            model += unmet_variable + vehicle_count * route.operating_cost * 0.001
-            model += unmet_variable >= demand - capacity_total
-            model += vehicle_count * average_capacity >= demand - unmet_variable
-            model += vehicle_count <= len(vehicles)
-            model += trip_count <= route.max_frequency
-            model += vehicle_count >= 1 if vehicles else vehicle_count == 0
-            model.solve(pulp.PULP_CBC_CMD(msg=False))
-            required_trips = int(round(pulp.value(trip_count)))
-            recommended = int(round(pulp.value(vehicle_count)))
-        else:
-            available_capacity = sum(max(v.capacity, 1) for v in vehicles)
-            required_trips = int(np.ceil(demand / max(available_capacity / max(len(vehicles), 1), 40)))
-            required_trips = max(route.min_frequency, min(required_trips, route.max_frequency))
-            recommended = min(len(vehicles), max(1, int(np.ceil(demand / 50))))
-        capacity = sum(v.capacity for v in vehicles[:recommended]) if recommended else 0
+    for code, route, demand in route_inputs:
+        required_trips = int(round(pulp.value(trip_vars[code])))
+        assigned_vehicles = [
+            vehicle for vehicle in available_vehicles
+            if pulp.value(assignment_vars[code][vehicle.id]) > 0.5
+        ]
+        recommended = len(assigned_vehicles)
+        capacity = min(
+            required_trips * max_capacity,
+            sum(v.capacity * trips_per_vehicle[code] for v in assigned_vehicles),
+        )
         unmet = max(0.0, demand - capacity)
-        utilization = min(100.0, demand / max(capacity, 1) * 100)
-        cost = recommended * route.operating_cost
-        feasible = unmet <= 1e-6 and recommended <= len(vehicles)
+        utilization = demand / capacity * 100 if capacity > 0 else 0.0
+        cost = required_trips * route.operating_cost
+        feasible = unmet <= 1e-6 and recommended <= len(available_vehicles)
         plan = {
             "route_id": route.id,
             "route_code": code,
             "route_name": route.name,
             "predicted_demand": round(demand, 2),
+            "current_allocated_vehicles": current_by_route.get(route.id, 0),
             "required_trips": required_trips,
             "recommended_vehicles": recommended,
             "vehicle_utilization": round(utilization, 2),
@@ -222,6 +267,7 @@ def optimize_routes(db: Session) -> dict:
         "feasible": all(p["feasible"] for p in plans),
         "plans": plans,
         "fleet_used": fleet_used,
+        "available_fleet": len(available_vehicles),
         "total_unmet_demand": round(total_unmet, 2),
-        "engine": "PuLP" if pulp else "Capacity-based fallback",
+        "engine": "PuLP integer linear program",
     }

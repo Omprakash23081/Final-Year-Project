@@ -1,12 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO, StringIO
+import random
 from typing import Optional
 
 import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -15,7 +16,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from .database import Base, engine, get_db
 from .models import (
-    Forecast, ModelRun, OptimizationPlan, PassengerCount, Route, Stop, Vehicle,
+    Forecast, ModelRun, OptimizationPlan, PassengerCount, Route, Schedule, Stop, Vehicle,
 )
 from .seed import seed_database
 from .services import get_passenger_frame, optimize_routes, train_and_forecast, validate_dataframe
@@ -44,6 +45,16 @@ def startup() -> None:
         db.close()
 
 
+def invalidate_analysis(db: Session) -> None:
+    db.query(Forecast).delete()
+    db.query(ModelRun).delete()
+    db.query(OptimizationPlan).delete()
+
+
+def invalidate_optimization(db: Session) -> None:
+    db.query(OptimizationPlan).delete()
+
+
 class RouteInput(BaseModel):
     route_code: str = Field(min_length=1, max_length=20)
     name: str = Field(min_length=1)
@@ -52,6 +63,12 @@ class RouteInput(BaseModel):
     min_frequency: int = Field(default=2, ge=1)
     max_frequency: int = Field(default=12, ge=1)
     operating_cost: float = Field(default=500, ge=0)
+
+    @model_validator(mode="after")
+    def validate_frequency_range(self):
+        if self.min_frequency > self.max_frequency:
+            raise ValueError("Minimum frequency cannot exceed maximum frequency.")
+        return self
 
 
 class StopInput(BaseModel):
@@ -77,11 +94,42 @@ def health():
 
 @app.post("/api/data/generate-synthetic")
 def generate_synthetic(db: Session = Depends(get_db)):
-    existing = db.query(PassengerCount).count()
-    if existing:
-        return {"status": "existing", "row_count": existing, "synthetic": True}
     seed_database(db)
-    return {"status": "generated", "row_count": db.query(PassengerCount).count(), "synthetic": True}
+    routes = db.query(Route).all()
+    rng = random.Random()
+    latest = db.query(PassengerCount.timestamp).order_by(PassengerCount.timestamp.desc()).first()
+    start = (
+        latest[0].replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        if latest else datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    )
+    inserted = 0
+    for route_index, route in enumerate(routes):
+        stops = db.query(Stop).filter(Stop.route_id == route.id).all()
+        for day in range(7):
+            for hour in range(24):
+                peak = 30 if 7 <= hour <= 9 or 16 <= hour <= 19 else 0
+                route_demand = 35 + route_index * 7 + peak
+                timestamp = start + timedelta(days=day, hours=hour)
+                for stop in stops:
+                    count = max(0, int(rng.gauss(route_demand / max(len(stops), 1), 3)))
+                    db.add(PassengerCount(
+                        timestamp=timestamp,
+                        route_id=route.route_code,
+                        stop_id=stop.stop_code,
+                        passenger_count=count,
+                        hour=hour,
+                        weekday=timestamp.weekday(),
+                        synthetic=True,
+                    ))
+                    inserted += 1
+    invalidate_analysis(db)
+    db.commit()
+    return {
+        "status": "generated",
+        "inserted_rows": inserted,
+        "row_count": db.query(PassengerCount).count(),
+        "synthetic": True,
+    }
 
 
 @app.post("/api/data/passenger/upload")
@@ -94,12 +142,34 @@ async def upload_passenger(file: UploadFile = File(...), db: Session = Depends(g
         raise HTTPException(400, f"Could not read CSV: {exc}") from exc
     validation = validate_dataframe(df)
     if not validation["valid"]:
-        raise HTTPException(422, detail=f"Missing required columns: {', '.join(validation['missing_columns'])}")
-    if validation["negative_passenger_counts"]:
-        raise HTTPException(422, "Passenger counts cannot be negative.")
+        raise HTTPException(422, detail=validation)
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.dropna(subset=["timestamp", "route_id", "stop_id", "passenger_count"])
+    df["passenger_count"] = pd.to_numeric(df["passenger_count"], errors="coerce")
+    df["route_id"] = df["route_id"].astype("string").str.strip()
+    df["stop_id"] = df["stop_id"].astype("string").str.strip()
+    invalid = (
+        df["timestamp"].isna()
+        | df["passenger_count"].isna()
+        | (df["passenger_count"] < 0)
+        | (df["passenger_count"] % 1 != 0)
+        | df["route_id"].isna()
+        | df["stop_id"].isna()
+        | df["route_id"].eq("")
+        | df["stop_id"].eq("")
+    )
+    removed_rows = int(invalid.sum())
+    df = df.loc[~invalid].copy()
+    validation["duplicate_rows"] = int(df.duplicated(
+        subset=["timestamp", "route_id", "stop_id", "passenger_count"]
+    ).sum())
+    df = df.drop_duplicates(subset=["timestamp", "route_id", "stop_id", "passenger_count"])
+    if df.empty:
+        raise HTTPException(422, detail={
+            **validation,
+            "error": "No valid, unique passenger rows were available to upload.",
+            "removed_invalid_rows": removed_rows,
+        })
     inserted = 0
     for row in df.to_dict("records"):
         timestamp = pd.Timestamp(row["timestamp"]).to_pydatetime()
@@ -113,8 +183,10 @@ async def upload_passenger(file: UploadFile = File(...), db: Session = Depends(g
             synthetic=False,
         ))
         inserted += 1
+    invalidate_analysis(db)
     db.commit()
     validation["inserted_rows"] = inserted
+    validation["removed_invalid_rows"] = removed_rows
     return validation
 
 
@@ -197,6 +269,7 @@ def create_route(payload: RouteInput, db: Session = Depends(get_db)):
         raise HTTPException(409, "Route code already exists.")
     route = Route(**payload.model_dump())
     db.add(route)
+    invalidate_analysis(db)
     db.commit()
     db.refresh(route)
     return {"id": route.id, **payload.model_dump()}
@@ -220,8 +293,20 @@ def update_route(route_id: int, payload: RouteInput, db: Session = Depends(get_d
     route = db.query(Route).filter(Route.id == route_id).first()
     if not route:
         raise HTTPException(404, "Route not found.")
+    duplicate = db.query(Route).filter(Route.route_code == payload.route_code, Route.id != route_id).first()
+    if duplicate:
+        raise HTTPException(409, "Route code already exists.")
+    previous_code = route.route_code
+    if previous_code != payload.route_code:
+        db.query(PassengerCount).filter(PassengerCount.route_id == previous_code).update(
+            {PassengerCount.route_id: payload.route_code}
+        )
+        db.query(Forecast).filter(Forecast.route_id == previous_code).update(
+            {Forecast.route_id: payload.route_code}
+        )
     for key, value in payload.model_dump().items():
         setattr(route, key, value)
+    invalidate_analysis(db)
     db.commit()
     return {"id": route.id, **payload.model_dump()}
 
@@ -231,6 +316,12 @@ def delete_route(route_id: int, db: Session = Depends(get_db)):
     route = db.query(Route).filter(Route.id == route_id).first()
     if not route:
         raise HTTPException(404, "Route not found.")
+    db.query(Vehicle).filter(Vehicle.route_id == route.id).update({Vehicle.route_id: None})
+    db.query(Stop).filter(Stop.route_id == route.id).update({Stop.route_id: None})
+    db.query(OptimizationPlan).filter(OptimizationPlan.route_id == route.id).delete()
+    db.query(Forecast).filter(Forecast.route_id == route.route_code).delete()
+    db.query(Schedule).filter(Schedule.route_id == route.id).delete()
+    invalidate_optimization(db)
     db.delete(route)
     db.commit()
     return {"deleted": route_id}
@@ -240,6 +331,8 @@ def delete_route(route_id: int, db: Session = Depends(get_db)):
 def create_stop(payload: StopInput, db: Session = Depends(get_db)):
     if db.query(Stop).filter(Stop.stop_code == payload.stop_code).first():
         raise HTTPException(409, "Stop code already exists.")
+    if payload.route_id is not None and not db.query(Route).filter(Route.id == payload.route_id).first():
+        raise HTTPException(404, "Route not found.")
     stop = Stop(**payload.model_dump())
     db.add(stop)
     db.commit()
@@ -256,12 +349,41 @@ def list_stops(db: Session = Depends(get_db)):
     ]
 
 
+@app.put("/api/stops/{stop_id}")
+def update_stop(stop_id: int, payload: StopInput, db: Session = Depends(get_db)):
+    stop = db.query(Stop).filter(Stop.id == stop_id).first()
+    if not stop:
+        raise HTTPException(404, "Stop not found.")
+    duplicate = db.query(Stop).filter(Stop.stop_code == payload.stop_code, Stop.id != stop_id).first()
+    if duplicate:
+        raise HTTPException(409, "Stop code already exists.")
+    if payload.route_id is not None and not db.query(Route).filter(Route.id == payload.route_id).first():
+        raise HTTPException(404, "Route not found.")
+    for key, value in payload.model_dump().items():
+        setattr(stop, key, value)
+    db.commit()
+    return {"id": stop.id, **payload.model_dump()}
+
+
+@app.delete("/api/stops/{stop_id}")
+def delete_stop(stop_id: int, db: Session = Depends(get_db)):
+    stop = db.query(Stop).filter(Stop.id == stop_id).first()
+    if not stop:
+        raise HTTPException(404, "Stop not found.")
+    db.delete(stop)
+    db.commit()
+    return {"deleted": stop_id}
+
+
 @app.post("/api/vehicles")
 def create_vehicle(payload: VehicleInput, db: Session = Depends(get_db)):
     if db.query(Vehicle).filter(Vehicle.vehicle_code == payload.vehicle_code).first():
         raise HTTPException(409, "Vehicle code already exists.")
+    if payload.route_id is not None and not db.query(Route).filter(Route.id == payload.route_id).first():
+        raise HTTPException(404, "Route not found.")
     vehicle = Vehicle(**payload.model_dump())
     db.add(vehicle)
+    invalidate_optimization(db)
     db.commit()
     db.refresh(vehicle)
     return {"id": vehicle.id, **payload.model_dump()}
@@ -272,24 +394,46 @@ def update_vehicle(vehicle_id: int, payload: VehicleInput, db: Session = Depends
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
     if not vehicle:
         raise HTTPException(404, "Vehicle not found.")
+    duplicate = db.query(Vehicle).filter(Vehicle.vehicle_code == payload.vehicle_code, Vehicle.id != vehicle_id).first()
+    if duplicate:
+        raise HTTPException(409, "Vehicle code already exists.")
+    if payload.route_id is not None and not db.query(Route).filter(Route.id == payload.route_id).first():
+        raise HTTPException(404, "Route not found.")
     for key, value in payload.model_dump().items():
         setattr(vehicle, key, value)
+    invalidate_optimization(db)
     db.commit()
     return {"id": vehicle.id, **payload.model_dump()}
 
 
+@app.delete("/api/vehicles/{vehicle_id}")
+def delete_vehicle(vehicle_id: int, db: Session = Depends(get_db)):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(404, "Vehicle not found.")
+    db.delete(vehicle)
+    invalidate_optimization(db)
+    db.commit()
+    return {"deleted": vehicle_id}
+
+
 @app.get("/api/vehicles")
 def list_vehicles(db: Session = Depends(get_db)):
+    plan_by_route = {p.route_id: p for p in db.query(OptimizationPlan).all()}
     return [
         {"id": v.id, "vehicle_code": v.vehicle_code, "capacity": v.capacity,
-         "available": v.available, "route_id": v.route_id, "operating_cost": v.operating_cost}
+         "available": v.available, "route_id": v.route_id, "operating_cost": v.operating_cost,
+         "utilization": plan_by_route[v.route_id].utilization if v.route_id in plan_by_route else 0}
         for v in db.query(Vehicle).all()
     ]
 
 
 @app.post("/api/optimization/run")
 def run_optimization(db: Session = Depends(get_db)):
-    result = optimize_routes(db)
+    try:
+        result = optimize_routes(db)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
     if "error" in result:
         raise HTTPException(422, result["error"])
     return result
@@ -300,10 +444,11 @@ def list_optimization(db: Session = Depends(get_db)):
     plans = db.query(OptimizationPlan).all()
     routes = {r.id: r for r in db.query(Route).all()}
     if not plans:
-        result = optimize_routes(db)
-        if "plans" not in result:
-            return result
-        return result
+        return {"feasible": False, "plans": [], "available_fleet": db.query(Vehicle).filter(Vehicle.available.is_(True)).count()}
+    current_by_route = {}
+    for vehicle in db.query(Vehicle).all():
+        if vehicle.route_id:
+            current_by_route[vehicle.route_id] = current_by_route.get(vehicle.route_id, 0) + 1
     return {
         "feasible": all(p.feasible for p in plans),
         "plans": [
@@ -312,6 +457,7 @@ def list_optimization(db: Session = Depends(get_db)):
                 "route_code": routes[p.route_id].route_code if p.route_id in routes else str(p.route_id),
                 "route_name": routes[p.route_id].name if p.route_id in routes else "Unknown",
                 "predicted_demand": p.predicted_demand,
+                "current_allocated_vehicles": current_by_route.get(p.route_id, 0),
                 "required_trips": p.required_trips,
                 "recommended_vehicles": p.recommended_vehicles,
                 "vehicle_utilization": p.utilization,
@@ -323,8 +469,9 @@ def list_optimization(db: Session = Depends(get_db)):
             for p in plans
         ],
         "fleet_used": sum(p.recommended_vehicles for p in plans),
+        "available_fleet": db.query(Vehicle).filter(Vehicle.available.is_(True)).count(),
         "total_unmet_demand": round(sum(p.unmet_demand for p in plans), 2),
-        "engine": "PuLP",
+        "engine": "PuLP integer linear program",
     }
 
 

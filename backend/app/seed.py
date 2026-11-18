@@ -50,7 +50,7 @@ def seed_database(db: Session) -> None:
                 base += route_index * 8
                 for stop_index in range(5):
                     count = max(0, int(random.gauss(base * 0.18, 4)))
-                    timestamp = now - timedelta(days=30 - day, hours=23 - hour)
+                    timestamp = now - timedelta(hours=(30 - day) * 24 - hour)
                     db.add(PassengerCount(
                         timestamp=timestamp,
                         route_id=f"R0{route_index + 1}",
